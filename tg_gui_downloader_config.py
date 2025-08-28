@@ -2,14 +2,24 @@
 import os, json, asyncio
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QListWidget,
-    QLabel, QFileDialog, QMessageBox, QListWidgetItem
+    QLabel, QFileDialog, QMessageBox, QListWidgetItem, QDateEdit, QHBoxLayout, QCheckBox
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QDate
 from telethon import TelegramClient
 from qasync import QEventLoop, asyncSlot
 
 CONFIG_FILE = "config.json"
 SESSION_FILE = "my_session.session"
+
+# 文件类型定义
+FILE_TYPES = {
+    "压缩文件": ['.zip', '.rar', '.7z'],
+    "视频": ['.mp4', '.mkv', '.avi'],
+    "图片": ['.jpg', '.png', '.gif'],
+    "文档": ['.pdf', '.docx', '.xlsx', '.txt'],
+    "音频": ['.mp3', '.wav'],
+    "JSON文件": ['.json']
+}
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -33,7 +43,7 @@ class TelegramDownloader(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Telegram 批量下载器")
-        self.resize(600, 800)
+        self.resize(700, 900)
         self.config = load_config()
         self.client = None
         self.dialogs = []
@@ -48,6 +58,25 @@ class TelegramDownloader(QWidget):
         self.choose_path_button.clicked.connect(self.choose_folder)
         layout.addWidget(self.choose_path_button)
 
+        # 日期选择
+        layout.addWidget(QLabel("选择开始日期（默认拉取最近消息）:"))
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDate(QDate.currentDate())
+        layout.addWidget(self.date_edit)
+
+        # 文件类型选择
+        layout.addWidget(QLabel("选择文件类型:"))
+        self.type_checkboxes = {}
+        type_layout = QHBoxLayout()
+        for name in FILE_TYPES.keys():
+            cb = QCheckBox(name)
+            cb.setChecked(True)  # 默认全勾选
+            cb.stateChanged.connect(self.update_message_list)  # 勾选变化刷新列表
+            type_layout.addWidget(cb)
+            self.type_checkboxes[name] = cb
+        layout.addLayout(type_layout)
+
         # 群组列表
         layout.addWidget(QLabel("请选择群组/频道："))
         self.group_list = QListWidget()
@@ -57,15 +86,24 @@ class TelegramDownloader(QWidget):
         layout.addWidget(self.refresh_button)
 
         # 消息文件列表
-        layout.addWidget(QLabel("请选择要下载的文件："))
+        layout.addWidget(QLabel("请选择要下载的文件（默认未勾选）："))
         self.msg_list = QListWidget()
         self.msg_list.setSelectionMode(QListWidget.MultiSelection)
         layout.addWidget(self.msg_list)
 
-        # 下载按钮
+        # 全选按钮
+        self.select_all_button = QPushButton("全选")
+        self.select_all_button.clicked.connect(self.select_all_files)
+        layout.addWidget(self.select_all_button)
+
+        # 下载和清理按钮
         self.download_button = QPushButton("开始下载选中文件")
         self.download_button.clicked.connect(self.start_download)
         layout.addWidget(self.download_button)
+
+        self.clean_button = QPushButton("清理列表和状态")
+        self.clean_button.clicked.connect(self.clean_list)
+        layout.addWidget(self.clean_button)
 
         # 状态与进度
         self.status_label = QLabel("状态: 等待操作")
@@ -114,6 +152,7 @@ class TelegramDownloader(QWidget):
             self.group_list.addItem(d.name)
         self.status_label.setText(f"状态: 已加载 {len(self.dialogs)} 个群组/频道")
         self.msg_list.clear()
+        self.messages.clear()
 
     @asyncSlot()
     async def load_messages(self, dialog_index):
@@ -121,27 +160,51 @@ class TelegramDownloader(QWidget):
             return
         self.msg_list.clear()
         target = self.dialogs[dialog_index].entity
-        self.messages = [msg async for msg in self.client.iter_messages(target, limit=200) if msg.file and msg.file.name]
+        start_date = self.date_edit.date().toPyDate()
+
+        # 拉取消息
+        self.messages = [
+            msg async for msg in self.client.iter_messages(target, limit=1000)
+            if msg.file and msg.file.name and msg.date.date() >= start_date
+        ]
+
+        await self.update_message_list()
+
+    @asyncSlot()
+    async def update_message_list(self):
+        self.msg_list.clear()
+        allowed_exts = []
+        for name, cb in self.type_checkboxes.items():
+            if cb.isChecked():
+                allowed_exts.extend(FILE_TYPES[name])
         for msg in self.messages:
-            item = QListWidgetItem(f"{msg.file.name}")
-            item.setCheckState(Qt.Unchecked)
-            self.msg_list.addItem(item)
+            ext = os.path.splitext(msg.file.name)[1].lower() if msg.file else ""
+            if ext in allowed_exts:
+                item = QListWidgetItem(f"{msg.file.name}")
+                item.setCheckState(Qt.Unchecked)  # 默认未勾选
+                self.msg_list.addItem(item)
+
+    def select_all_files(self):
+        for i in range(self.msg_list.count()):
+            self.msg_list.item(i).setCheckState(Qt.Checked)
 
     @asyncSlot()
     async def start_download(self):
-        selected_items = [i for i in range(self.msg_list.count())
-                          if self.msg_list.item(i).checkState() == Qt.Checked]
+        selected_items = [
+            i for i in range(self.msg_list.count())
+            if self.msg_list.item(i).checkState() == Qt.Checked
+        ]
 
         save_dir = self.config.get("download_dir", os.getcwd())
         semaphore = asyncio.Semaphore(5)
         downloaded_files = 0
 
-        # 如果用户没有勾选任何文件，默认下载群组所有文件
+        # 用户未选择任何文件 → 默认下载列表中的所有文件
         if not selected_items:
-            if not self.messages:
-                QMessageBox.warning(self, "提示", "当前群组没有可下载的文件！")
-                return
-            selected_items = list(range(len(self.messages)))
+            selected_items = list(range(self.msg_list.count()))
+
+        total_files = len(selected_items)
+        self.progress_label.setText(f"已下载 0/{total_files} 个文件")
 
         async def download_message(msg):
             nonlocal downloaded_files
@@ -150,13 +213,19 @@ class TelegramDownloader(QWidget):
                 self.status_label.setText(f"正在下载: {os.path.basename(path)}")
                 await msg.download_media(file=path)
                 downloaded_files += 1
-                self.progress_label.setText(f"已下载 {downloaded_files}/{len(selected_items)} 个文件")
+                self.progress_label.setText(f"已下载 {downloaded_files}/{total_files} 个文件")
 
         tasks = [download_message(self.messages[i]) for i in selected_items]
         self.status_label.setText("状态: 开始下载…")
         await asyncio.gather(*tasks)
         self.status_label.setText("状态: 下载完成！")
         QMessageBox.information(self, "完成", f"下载完成！文件保存在 {save_dir}")
+
+    def clean_list(self):
+        self.msg_list.clear()
+        self.status_label.setText("状态: 已清理")
+        self.progress_label.setText("")
+        self.messages = []
 
 # ---------------------- 主程序 ----------------------
 def main():
@@ -167,7 +236,6 @@ def main():
     win = TelegramDownloader()
     win.show()
 
-    # 当选择群组时加载对应消息
     def on_group_changed():
         asyncio.ensure_future(win.load_messages(win.group_list.currentRow()))
     win.group_list.currentRowChanged.connect(on_group_changed)
